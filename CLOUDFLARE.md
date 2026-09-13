@@ -1,6 +1,6 @@
 # Cloudflare deployment preparation
 
-Prepared on `cloudflare-deploy` from `98b5bd26e8feacacfd4b74ff58411acb8154d212`, matching upstream HEAD on 2026-09-13. No remote deployment or DNS changes were made.
+Prepared on `cloudflare-deploy` from `98b5bd26e8feacacfd4b74ff58411acb8154d212`, matching upstream HEAD on 2026-09-13. The preview is deployed at <https://wacrm.varun-spike.workers.dev>. No custom domain or DNS changes were made.
 
 ## Commands
 
@@ -50,4 +50,4 @@ Sources: [Cloudflare Next.js/vinext guide](https://developers.cloudflare.com/wor
 
 ## Repository handoff
 
-Changes are staged locally on cloudflare-deploy. Commit creation failed with: Author identity unknown; fatal: unable to auto-detect email address. No commit or push was made, and main remains at the base commit. Configure the intended Git author locally before committing. The accompanying patch can be applied to a checkout of the base commit.
+Cloudflare changes are committed and pushed on `cloudflare-deploy`; `main` remains unchanged. The Worker deployment succeeded, and Supabase Auth now uses the preview as its Site URL with `https://wacrm.varun-spike.workers.dev/**` allowed for redirects. Private runtime values still need to be entered directly in Cloudflare before testing privileged and Meta-backed features.
