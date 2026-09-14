@@ -9,6 +9,7 @@ import { reopenClosedConversation } from '@/lib/conversations/reopen'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
+import { engineSendText } from '@/lib/flows/meta-send'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
@@ -572,6 +573,54 @@ async function handleReaction(
   }
 }
 
+async function dispatchPriceLookup(args: {
+  accountId: string
+  conversationId: string
+  contactId: string
+  userId: string
+  text: string
+}): Promise<boolean> {
+  const match = args.text.trim().match(/^price\s+(.+)$/i)
+  if (!match) return false
+
+  const partNumber = match[1].trim().toUpperCase()
+  if (!partNumber || partNumber.length > 100) return false
+
+  try {
+    const { data, error } = await supabaseAdmin()
+      .from('price_list')
+      .select('item, part_number, unit_price_usd, hsn_code, country_of_origin')
+      .eq('part_number', partNumber)
+      .limit(1)
+
+    if (error) throw error
+
+    const row = data?.[0]
+    const reply = row
+      ? [
+          '*Price lookup*',
+          `Part Number: ${row.part_number}`,
+          `Item: ${row.item}`,
+          `Ex Works Unit Price: USD ${Number(row.unit_price_usd).toFixed(2)}`,
+          `HSN Code: ${row.hsn_code}`,
+          `Country of Origin: ${row.country_of_origin}`,
+        ].join('\n')
+      : `No exact price found for ${partNumber}. Check the part number and try again as: price PART-NUMBER`
+
+    await engineSendText({
+      accountId: args.accountId,
+      userId: args.userId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      text: reply,
+    })
+    return true
+  } catch (error) {
+    console.error('[price lookup] failed:', error)
+    return false
+  }
+}
+
 async function processMessage(
   message: WhatsAppMessage,
   contact: { profile: { name: string }; wa_id: string },
@@ -788,34 +837,48 @@ async function processMessage(
   // no active flows take the runner's early-exit "no_match" path
   // basically for free (one indexed SELECT for the active run).
   // ============================================================
-  const flowResult = await dispatchInboundToFlows({
-    accountId,
-    userId: configOwnerUserId,
-    contactId: contactRecord.id,
-    conversationId: conversation.id,
-    message:
-      interactiveReplyId
-        ? {
-            kind: 'interactive_reply',
-            reply_id: interactiveReplyId,
-            reply_title: contentText ?? '',
-            meta_message_id: message.id,
-          }
-        : {
-            kind: 'text',
-            text: contentText ?? message.text?.body ?? '',
-            meta_message_id: message.id,
-          },
-    isFirstInboundMessage,
-  })
-  const flowConsumed = flowResult.consumed
-
   // Fire any automations that react to this webhook event. All dispatches
   // run here (not earlier) so the contact, conversation, and inbound
   // message all exist before any step — including send_message — runs.
   // Fire-and-forget: a slow or failing automation must not block the
   // webhook's 200 OK response to Meta.
   const inboundText = contentText ?? message.text?.body ?? ''
+
+  // A deliberately narrow price-list command. Exact commands avoid
+  // accidentally quoting a customer who merely mentions a part number in
+  // normal conversation, and keep the lookup deterministic without an AI key.
+  const priceLookupHandled = await dispatchPriceLookup({
+    accountId,
+    conversationId: conversation.id,
+    contactId: contactRecord.id,
+    userId: configOwnerUserId,
+    text: inboundText,
+  })
+
+  const flowResult = priceLookupHandled
+    ? { consumed: true }
+    : await dispatchInboundToFlows({
+        accountId,
+        userId: configOwnerUserId,
+        contactId: contactRecord.id,
+        conversationId: conversation.id,
+        message:
+          interactiveReplyId
+            ? {
+                kind: 'interactive_reply',
+                reply_id: interactiveReplyId,
+                reply_title: contentText ?? '',
+                meta_message_id: message.id,
+              }
+            : {
+                kind: 'text',
+                text: inboundText,
+                meta_message_id: message.id,
+              },
+        isFirstInboundMessage,
+      })
+  const flowConsumed = flowResult.consumed
+
   const automationTriggers: (
     | 'new_contact_created'
     | 'first_inbound_message'

@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 const h = vi.hoisted(() => ({
   runAutomationsForTrigger: vi.fn(),
   dispatchInboundToFlows: vi.fn(),
+  engineSendText: vi.fn(),
   dispatchInboundToAiReply: vi.fn(),
   dispatchWebhookEvent: vi.fn(),
   state: {
@@ -21,6 +22,7 @@ const h = vi.hoisted(() => ({
     automationCompleted: 0,
     /** whatsapp_config.mirror_inbound_media for the matched row (#466). */
     mirrorInboundMedia: true as boolean | undefined,
+    priceRows: [] as Record<string, unknown>[],
     /** Objects the inbound-media mirror pushed into chat-media. */
     storageUploads: [] as {
       bucket: string
@@ -92,6 +94,15 @@ vi.mock('@supabase/supabase-js', () => ({
                     }),
                   }),
                 }),
+              }),
+            }),
+          }
+        case 'price_list':
+          return {
+            select: () => ({
+              eq: () => ({
+                limit: () =>
+                  Promise.resolve({ data: h.state.priceRows, error: null }),
               }),
             }),
           }
@@ -195,6 +206,9 @@ vi.mock('@/lib/automations/engine', () => ({
 vi.mock('@/lib/flows/engine', () => ({
   dispatchInboundToFlows: h.dispatchInboundToFlows,
 }))
+vi.mock('@/lib/flows/meta-send', () => ({
+  engineSendText: h.engineSendText,
+}))
 vi.mock('@/lib/ai/auto-reply', () => ({
   dispatchInboundToAiReply: h.dispatchInboundToAiReply,
 }))
@@ -258,6 +272,7 @@ beforeEach(() => {
   h.state.automationStarted = 0
   h.state.automationCompleted = 0
   h.state.mirrorInboundMedia = true
+  h.state.priceRows = []
   h.state.storageUploads = []
   h.state.storageUploadError = null
   mockGetMediaUrl.mockResolvedValue({
@@ -313,6 +328,29 @@ describe('inbound webhook: idempotent insert (#367)', () => {
     expect(h.runAutomationsForTrigger).not.toHaveBeenCalled()
     expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
     expect(h.dispatchWebhookEvent).not.toHaveBeenCalled()
+  })
+})
+
+describe('inbound webhook: exact price lookup', () => {
+  it('answers `price PART-NUMBER` from the price list and consumes the message', async () => {
+    h.state.priceRows = [{
+      item: 'BEND FITTING',
+      part_number: 'S100ESB',
+      unit_price_usd: '197.830000000',
+      hsn_code: '73072300',
+      country_of_origin: 'JAPAN',
+    }]
+
+    await runWebhook({ ...TEXT_MESSAGE, text: { body: 'price s100esb' } })
+
+    expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({
+      accountId: 'acc-1',
+      conversationId: 'conv-1',
+      contactId: 'contact-1',
+      text: expect.stringContaining('Ex Works Unit Price: USD 197.83'),
+    }))
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
   })
 })
 
