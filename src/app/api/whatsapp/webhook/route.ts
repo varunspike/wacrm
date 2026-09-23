@@ -583,11 +583,28 @@ async function dispatchPriceLookup(args: {
   userId: string
   text: string
 }): Promise<boolean> {
-  const match = args.text.trim().match(/^price\s+(.+)$/i)
-  if (!match) return false
+  const text = args.text.trim()
+  const asksForPrice = /\b(?:price|pricing|quote|cost)\b|\bhow\s+much\b/i.test(text)
+  const tokens = text.toUpperCase().match(/[A-Z0-9][A-Z0-9._/-]*/g) ?? []
+  const partNumbers = tokens.filter(
+    (token) => token.length <= 100 && /[A-Z]/.test(token) && /\d/.test(token),
+  )
+  const isBarePartNumber = partNumbers.length === 1 && tokens.length === 1
 
-  const partNumber = match[1].trim().toUpperCase()
-  if (!partNumber || partNumber.length > 100) return false
+  if (!asksForPrice && !isBarePartNumber) return false
+
+  if (partNumbers.length !== 1) {
+    await engineSendText({
+      accountId: args.accountId,
+      userId: args.userId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      text: 'Please send one TK-Fujikin part code at a time.\n\nExample: Price S100ESB',
+    })
+    return true
+  }
+
+  const partNumber = partNumbers[0]
 
   try {
     const { data, error } = await supabaseAdmin()
@@ -645,7 +662,10 @@ async function dispatchWelcomeJourney(args: {
       return true
     }
 
-    if (!args.isFirstInboundMessage && args.text.trim().toLowerCase() !== 'menu') {
+    const text = args.text.trim()
+    const isGreeting = /^(?:hi|hello|hey)(?:\s+there)?[!. ]*$|^good\s+(?:morning|afternoon|evening|day)[!. ]*$/i.test(text)
+
+    if (!args.isFirstInboundMessage && text.toLowerCase() !== 'menu' && !isGreeting) {
       return false
     }
 
@@ -888,9 +908,8 @@ async function processMessage(
   // webhook's 200 OK response to Meta.
   const inboundText = contentText ?? message.text?.body ?? ''
 
-  // A deliberately narrow price-list command. Exact commands avoid
-  // accidentally quoting a customer who merely mentions a part number in
-  // normal conversation, and keep the lookup deterministic without an AI key.
+  // Deterministic price intent: natural wording and bare TKF-style part codes
+  // are accepted, but a database result is still required before quoting.
   const priceLookupHandled = await dispatchPriceLookup({
     accountId,
     conversationId: conversation.id,

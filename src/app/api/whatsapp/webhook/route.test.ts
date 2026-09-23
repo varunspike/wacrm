@@ -229,7 +229,7 @@ const TEXT_MESSAGE = {
   from: '15551230000',
   timestamp: '1700000000',
   type: 'text',
-  text: { body: 'hello' },
+  text: { body: 'ordinary message' },
 }
 
 function inboundRequest(message: Record<string, unknown> = TEXT_MESSAGE) {
@@ -354,6 +354,36 @@ describe('inbound webhook: exact price lookup', () => {
     expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
     expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
   })
+
+  it.each([
+    'What is the price of S100ESB?',
+    'Can you quote S100ESB please?',
+    'S100ESB',
+  ])('answers the natural request `%s` with an exact database match', async (body) => {
+    h.state.priceRows = [{
+      item: 'BEND FITTING',
+      part_number: 'S100ESB',
+      unit_price_usd: '197.830000000',
+      hsn_code: '73072300',
+      country_of_origin: 'JAPAN',
+    }]
+
+    await runWebhook({ ...TEXT_MESSAGE, text: { body } })
+
+    expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('Part Number: S100ESB'),
+    }))
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+  })
+
+  it('asks for one part code when the user requests pricing without one', async () => {
+    await runWebhook({ ...TEXT_MESSAGE, text: { body: 'I need pricing' } })
+
+    expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('Please send one TK-Fujikin part code'),
+    }))
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+  })
 })
 
 describe('inbound webhook: welcome journey', () => {
@@ -387,6 +417,15 @@ describe('inbound webhook: welcome journey', () => {
       expect.objectContaining({
         text: expect.stringContaining('Example: Price S100ESB'),
       }),
+    )
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+  })
+
+  it('shows the welcome menu when a returning user sends a greeting', async () => {
+    await runWebhook({ ...TEXT_MESSAGE, text: { body: 'Hello there!' } })
+
+    expect(h.engineSendInteractiveButtons).toHaveBeenCalledWith(
+      expect.objectContaining({ buttons: [{ id: 'tkf_prices', title: 'Prices' }] }),
     )
     expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
   })
