@@ -6,6 +6,9 @@ const h = vi.hoisted(() => ({
   dispatchInboundToFlows: vi.fn(),
   engineSendInteractiveButtons: vi.fn(),
   engineSendText: vi.fn(),
+  getUsdInr: vi.fn(),
+  saveQuote: vi.fn(),
+  flagReview: vi.fn(),
   dispatchInboundToAiReply: vi.fn(),
   dispatchWebhookEvent: vi.fn(),
   state: {
@@ -33,6 +36,11 @@ const h = vi.hoisted(() => ({
     /** Error the next storage upload resolves with, if any. */
     storageUploadError: null as { message: string } | null,
   },
+}))
+
+vi.mock('@/lib/pricing', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/pricing')>(),
+  getUsdInr: h.getUsdInr,
 }))
 
 vi.mock('next/server', () => ({
@@ -68,6 +76,10 @@ vi.mock('@supabase/supabase-js', () => ({
         case 'conversations':
           // findOrCreateConversation: select().eq().eq().order().limit()
           return {
+            update: (value: unknown) => {
+              h.flagReview(value)
+              return { eq: () => ({ eq: async () => ({ error: null }) }) }
+            },
             select: () => ({
               eq: () => ({
                 eq: () => ({
@@ -98,10 +110,14 @@ vi.mock('@supabase/supabase-js', () => ({
               }),
             }),
           }
+        case 'price_quotes':
+          return {
+            insert: (rows: unknown) => ({ select: () => h.saveQuote(rows) }),
+          }
         case 'price_list':
           return {
             select: () => ({
-              eq: () => ({
+              in: () => ({
                 limit: () =>
                   Promise.resolve({ data: h.state.priceRows, error: null }),
               }),
@@ -275,6 +291,18 @@ beforeEach(() => {
   h.state.automationCompleted = 0
   h.state.mirrorInboundMedia = true
   h.state.priceRows = []
+  h.getUsdInr.mockResolvedValue({
+    rate: 85,
+    date: '2026-09-14',
+    fetchedAt: '2026-09-14T10:00:00Z',
+    source: 'test',
+  })
+  h.saveQuote.mockImplementation(async (rows: { id: string }[]) => ({
+    data: rows
+      .map((row, index) => ({ id: row.id, reference_number: index + 1 }))
+      .reverse(),
+    error: null,
+  }))
   h.state.storageUploads = []
   h.state.storageUploadError = null
   mockGetMediaUrl.mockResolvedValue({
@@ -349,8 +377,9 @@ describe('inbound webhook: exact price lookup', () => {
       accountId: 'acc-1',
       conversationId: 'conv-1',
       contactId: 'contact-1',
-      text: expect.stringContaining('Ex Works Unit Price: USD 197.83'),
+      text: expect.stringContaining('₹25,114.02'),
     }))
+    expect(h.saveQuote).toHaveBeenCalledTimes(1)
     expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
     expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
   })
@@ -371,18 +400,70 @@ describe('inbound webhook: exact price lookup', () => {
     await runWebhook({ ...TEXT_MESSAGE, text: { body } })
 
     expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({
-      text: expect.stringContaining('Part Number: S100ESB'),
+      text: expect.stringContaining('S100ESB'),
     }))
     expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
   })
 
-  it('asks for one part code when the user requests pricing without one', async () => {
+  it('asks for part codes when the user requests pricing without one', async () => {
     await runWebhook({ ...TEXT_MESSAGE, text: { body: 'I need pricing' } })
 
     expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({
-      text: expect.stringContaining('Please send one TK-Fujikin part code'),
+      text: expect.stringContaining('1–50 TK-Fujikin part codes'),
     }))
     expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+  })
+
+  it('quotes up to 50 unique codes in request order with one forex snapshot', async () => {
+    h.state.priceRows = Array.from({ length: 50 }, (_, index) => ({
+      part_number: `P${index + 1}`,
+      unit_price_usd: 10,
+      item: 'FITTING',
+      hsn_code: '73072300',
+      country_of_origin: 'JAPAN',
+    }))
+    const codes = h.state.priceRows.map((row) => row.part_number)
+
+    await runWebhook({
+      ...TEXT_MESSAGE,
+      text: { body: `price\n${codes.join('\n')}\nP1` },
+    })
+
+    expect(h.getUsdInr).toHaveBeenCalledTimes(1)
+    expect(h.saveQuote.mock.calls[0][0]).toHaveLength(50)
+    expect(h.engineSendText).toHaveBeenCalled()
+    for (const [message] of h.engineSendText.mock.calls) {
+      expect(message.text.length).toBeLessThanOrEqual(3500)
+    }
+  })
+
+  it('holds a quote for review when live pricing fails', async () => {
+    h.state.priceRows = [{ part_number: 'S100ESB', unit_price_usd: 10 }]
+    h.getUsdInr.mockRejectedValue(new Error('rate unavailable'))
+
+    await runWebhook({ ...TEXT_MESSAGE, text: { body: 'price S100ESB' } })
+
+    expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('Pricing needs confirmation'),
+    }))
+    expect(h.flagReview).toHaveBeenCalledWith(expect.objectContaining({
+      ai_autoreply_disabled: true,
+    }))
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+
+  it('rejects requests above the 50-code limit', async () => {
+    const codes = Array.from({ length: 51 }, (_, index) => `P${index + 1}`)
+
+    await runWebhook({
+      ...TEXT_MESSAGE,
+      text: { body: `price ${codes.join(' ')}` },
+    })
+
+    expect(h.engineSendText).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining('1–50 TK-Fujikin part codes'),
+    }))
+    expect(h.getUsdInr).not.toHaveBeenCalled()
   })
 })
 

@@ -1,3 +1,5 @@
+import { formatPriceTables } from '@/lib/price-table'
+import { getUsdInr, sellingPriceInr, FOREX_BUFFER, MARKUP } from '@/lib/pricing'
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
@@ -589,55 +591,130 @@ async function dispatchPriceLookup(args: {
   const partNumbers = tokens.filter(
     (token) => token.length <= 100 && /[A-Z]/.test(token) && /\d/.test(token),
   )
+  const uniquePartNumbers = [...new Set(partNumbers)]
   const isBarePartNumber = partNumbers.length === 1 && tokens.length === 1
 
   if (!asksForPrice && !isBarePartNumber) return false
 
-  if (partNumbers.length !== 1) {
+  if (!uniquePartNumbers.length || uniquePartNumbers.length > 50) {
     await engineSendText({
       accountId: args.accountId,
       userId: args.userId,
       conversationId: args.conversationId,
       contactId: args.contactId,
-      text: 'Please send one TK-Fujikin part code at a time.\n\nExample: Price S100ESB',
+      text: 'Send 1–50 TK-Fujikin part codes, separated by spaces, commas, semicolons or new lines.\n\nExample:\nPrice S100ESB S100HESB-P',
     })
     return true
   }
 
-  const partNumber = partNumbers[0]
+  const partNumber = uniquePartNumbers.join(', ')
 
   try {
     const { data, error } = await supabaseAdmin()
       .from('price_list')
       .select('item, part_number, unit_price_usd, hsn_code, country_of_origin')
-      .eq('part_number', partNumber)
-      .limit(1)
+      .in('part_number', uniquePartNumbers)
+      .limit(1000)
 
     if (error) throw error
+    if (data?.length === 1000) throw new Error('Too many catalogue matches')
 
-    const row = data?.[0]
-    const reply = row
-      ? [
-          '*Price lookup*',
-          `Part Number: ${row.part_number}`,
-          `Item: ${row.item}`,
-          `Ex Works Unit Price: USD ${Number(row.unit_price_usd).toFixed(2)}`,
-          `HSN Code: ${row.hsn_code}`,
-          `Country of Origin: ${row.country_of_origin}`,
-        ].join('\n')
-      : `No exact price found for ${partNumber}. Check the part number and try again as: price PART-NUMBER`
-
-    await engineSendText({
-      accountId: args.accountId,
-      userId: args.userId,
-      conversationId: args.conversationId,
-      contactId: args.contactId,
-      text: reply,
+    type PriceRow = {
+      item: string
+      part_number: string
+      unit_price_usd: number | string
+      hsn_code: string
+      country_of_origin: string
+    }
+    const rows: PriceRow[] = data ?? []
+    const matched = uniquePartNumbers.map((code) =>
+      rows.filter((row) => row.part_number === code),
+    )
+    const fx = matched.some((matches) => matches.length === 1)
+      ? await getUsdInr()
+      : undefined
+    const snapshots = []
+    const blocks = []
+    const currency = new Intl.NumberFormat('en-IN', {
+      style: 'currency',
+      currency: 'INR',
     })
+
+    for (const [index, code] of uniquePartNumbers.entries()) {
+      const matches = matched[index]
+      if (matches.length !== 1) {
+        blocks.push({ code, amount: matches.length ? 'REVIEW' : 'NOT FOUND' })
+        continue
+      }
+
+      const row = matches[0]
+      const price = sellingPriceInr(Number(row.unit_price_usd), fx!.rate)
+      const id = crypto.randomUUID()
+      snapshots.push({
+        id,
+        account_id: args.accountId,
+        conversation_id: args.conversationId,
+        part_number: row.part_number,
+        unit_price_usd: row.unit_price_usd,
+        usd_inr: fx!.rate,
+        forex_buffer: FOREX_BUFFER,
+        markup: MARKUP,
+        rate_date: fx!.date,
+        rate_fetched_at: fx!.fetchedAt,
+        rate_source: fx!.source,
+        unit_price_inr: price,
+      })
+      blocks.push({ code, amount: currency.format(price), reference: id })
+    }
+
+    if (snapshots.length) {
+      const { data: saved, error: saveError } = await supabaseAdmin()
+        .from('price_quotes')
+        .insert(snapshots)
+        .select('id, reference_number')
+      if (saveError) throw saveError
+
+      for (const block of blocks) {
+        if (!block.reference) continue
+        const row = saved?.find(
+          (quote: { id: string }) => quote.id === block.reference,
+        )
+        if (!row || !/^[1-9]\d*$/.test(String(row.reference_number))) {
+          throw new Error('Missing quote reference number')
+        }
+        block.reference = `TKF_${String(row.reference_number).padStart(3, '0')}`
+      }
+    }
+
+    for (const text of formatPriceTables(blocks)) {
+      await engineSendText({ ...args, text })
+    }
     return true
   } catch (error) {
     console.error('[price lookup] failed:', error)
-    return false
+    // Consume failed price requests so AI can never invent a replacement quote.
+    try {
+      const { error: flagError } = await supabaseAdmin()
+        .from('conversations')
+        .update({
+          ai_autoreply_disabled: true,
+          ai_handoff_summary: `Pricing needs review for ${partNumber}: automatic quote unavailable.`,
+        })
+        .eq('id', args.conversationId)
+        .eq('account_id', args.accountId)
+      if (flagError) console.error('[price lookup] review flag failed:', flagError)
+    } catch (flagError) {
+      console.error('[price lookup] review flag failed:', flagError)
+    }
+    try {
+      await engineSendText({
+        ...args,
+        text: 'Pricing needs confirmation. Our team will review your enquiry.',
+      })
+    } catch (sendError) {
+      console.error('[price lookup] confirmation send failed:', sendError)
+    }
+    return true
   }
 }
 
@@ -657,7 +734,7 @@ async function dispatchWelcomeJourney(args: {
         userId: args.userId,
         conversationId: args.conversationId,
         contactId: args.contactId,
-        text: 'Please type "Price", followed by a space and the TK-Fujikin part code.\n\nExample: Price S100ESB',
+        text: 'Please type "Price", followed by up to 50 TK-Fujikin part codes separated by spaces, commas or new lines.\n\nExample: Price S100ESB S100HESB-P',
       })
       return true
     }
