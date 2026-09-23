@@ -9,7 +9,10 @@ import { reopenClosedConversation } from '@/lib/conversations/reopen'
 import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
-import { engineSendText } from '@/lib/flows/meta-send'
+import {
+  engineSendInteractiveButtons,
+  engineSendText,
+} from '@/lib/flows/meta-send'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
@@ -621,6 +624,47 @@ async function dispatchPriceLookup(args: {
   }
 }
 
+async function dispatchWelcomeJourney(args: {
+  accountId: string
+  conversationId: string
+  contactId: string
+  userId: string
+  text: string
+  interactiveReplyId: string | null
+  isFirstInboundMessage: boolean
+}): Promise<boolean> {
+  try {
+    if (args.interactiveReplyId === 'tkf_prices') {
+      await engineSendText({
+        accountId: args.accountId,
+        userId: args.userId,
+        conversationId: args.conversationId,
+        contactId: args.contactId,
+        text: 'Please type "Price", followed by a space and the TK-Fujikin part code.\n\nExample: Price S100ESB',
+      })
+      return true
+    }
+
+    if (!args.isFirstInboundMessage && args.text.trim().toLowerCase() !== 'menu') {
+      return false
+    }
+
+    await engineSendInteractiveButtons({
+      accountId: args.accountId,
+      userId: args.userId,
+      conversationId: args.conversationId,
+      contactId: args.contactId,
+      bodyText:
+        "Dear user, welcome to TKF Quote Bot, powered by Cleantech Services Pte. Ltd. We're the authorized distributor for TK-Fujikin products in India.\n\nWhat can I help you with today?",
+      buttons: [{ id: 'tkf_prices', title: 'Prices' }],
+    })
+    return true
+  } catch (error) {
+    console.error('[welcome journey] failed:', error)
+    return false
+  }
+}
+
 async function processMessage(
   message: WhatsAppMessage,
   contact: { profile: { name: string }; wa_id: string },
@@ -855,7 +899,19 @@ async function processMessage(
     text: inboundText,
   })
 
-  const flowResult = priceLookupHandled
+  const welcomeJourneyHandled =
+    !priceLookupHandled &&
+    (await dispatchWelcomeJourney({
+      accountId,
+      conversationId: conversation.id,
+      contactId: contactRecord.id,
+      userId: configOwnerUserId,
+      text: inboundText,
+      interactiveReplyId,
+      isFirstInboundMessage,
+    }))
+
+  const flowResult = priceLookupHandled || welcomeJourneyHandled
     ? { consumed: true }
     : await dispatchInboundToFlows({
         accountId,

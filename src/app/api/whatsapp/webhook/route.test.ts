@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 const h = vi.hoisted(() => ({
   runAutomationsForTrigger: vi.fn(),
   dispatchInboundToFlows: vi.fn(),
+  engineSendInteractiveButtons: vi.fn(),
   engineSendText: vi.fn(),
   dispatchInboundToAiReply: vi.fn(),
   dispatchWebhookEvent: vi.fn(),
@@ -11,7 +12,7 @@ const h = vi.hoisted(() => ({
     // Result the message upsert's .select() resolves to. A genuine insert
     // returns the row; a replayed delivery conflicts and returns [].
     messageUpsertResult: [{ id: 'msg-1' }] as { id: string }[],
-    priorCustomerMsgCount: 0,
+    priorCustomerMsgCount: 1,
     /** Row `lookupInternalIdByMetaId` resolves for a `context.id`. */
     replyContextParent: null as { id: string } | null,
     conversation: { id: 'conv-1', unread_count: 0, account_id: 'acc-1' },
@@ -207,6 +208,7 @@ vi.mock('@/lib/flows/engine', () => ({
   dispatchInboundToFlows: h.dispatchInboundToFlows,
 }))
 vi.mock('@/lib/flows/meta-send', () => ({
+  engineSendInteractiveButtons: h.engineSendInteractiveButtons,
   engineSendText: h.engineSendText,
 }))
 vi.mock('@/lib/ai/auto-reply', () => ({
@@ -263,7 +265,7 @@ async function runWebhook(message?: Record<string, unknown>) {
 beforeEach(() => {
   vi.clearAllMocks()
   h.state.messageUpsertResult = [{ id: 'msg-1' }]
-  h.state.priorCustomerMsgCount = 0
+  h.state.priorCustomerMsgCount = 1
   h.state.replyContextParent = null
   h.state.conversation = { id: 'conv-1', unread_count: 0, account_id: 'acc-1' }
   h.state.upsertCalls = []
@@ -351,6 +353,42 @@ describe('inbound webhook: exact price lookup', () => {
     }))
     expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
     expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+})
+
+describe('inbound webhook: welcome journey', () => {
+  it('welcomes a first-time sender with a Prices reply button', async () => {
+    h.state.priorCustomerMsgCount = 0
+
+    await runWebhook()
+
+    expect(h.engineSendInteractiveButtons).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bodyText: expect.stringContaining('welcome to TKF Quote Bot'),
+        buttons: [{ id: 'tkf_prices', title: 'Prices' }],
+      }),
+    )
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+
+  it('explains the price command when Prices is tapped', async () => {
+    await runWebhook({
+      ...TEXT_MESSAGE,
+      type: 'interactive',
+      text: undefined,
+      interactive: {
+        type: 'button_reply',
+        button_reply: { id: 'tkf_prices', title: 'Prices' },
+      },
+    })
+
+    expect(h.engineSendText).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining('Example: Price S100ESB'),
+      }),
+    )
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
   })
 })
 
@@ -569,10 +607,10 @@ describe('inbound webhook: after() awaits automations (#368)', () => {
   it('every triggered automation settles before the after() callback resolves', async () => {
     await runWebhook()
 
-    // first_inbound_message + new_message_received + keyword_match.
-    expect(h.state.automationStarted).toBe(3)
+    // new_message_received + keyword_match.
+    expect(h.state.automationStarted).toBe(2)
     // If the dispatches were fire-and-forget, completed would still be 0
     // here — the callback would have resolved before the timers fired.
-    expect(h.state.automationCompleted).toBe(3)
+    expect(h.state.automationCompleted).toBe(2)
   })
 })
